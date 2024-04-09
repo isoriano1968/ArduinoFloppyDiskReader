@@ -69,8 +69,21 @@ DEFINE_GUID(GUID_DEVINTERFACE_COMPORT,0x86e0d1e0, 0x8089, 0x11d0, 0x9c, 0xe4, 0x
 #include <sys/ioctl.h>
 #include <errno.h>
 #include <cstring>
+#ifdef __linux
 #include <linux/serial.h>
+#endif
+#endif
 
+#ifdef __sun
+#include <limits.h>
+#include <sys/termios.h>
+#ifndef TIOCINQ
+#ifdef FIONREAD
+#define TIOCINQ FIONREAD
+#else
+#define TIOCINQ 0x541B
+#endif
+#endif
 #endif
 
 #include <string>
@@ -103,13 +116,14 @@ SerialIO::~SerialIO() {
 bool SerialIO::isPortOpen() const {
 #ifdef FTDI_D2XX_AVAILABLE
 	if (m_ftdi.isOpen()) return true;
+	printf("FTDI_D2XX_AVAILABLE port open\n");
 #endif
 #ifdef _WIN32
 	return m_portHandle != INVALID_HANDLE_VALUE;
 #else
 	return m_portHandle != -1;
 #endif
-
+	printf("FTDI_D2XX_AVAILABLE port NOT open\n");
 	return false;
 }
 
@@ -147,6 +161,7 @@ void SerialIO::setRTS(bool enableRTS) {
 #else
 	int pinToControl = TIOCM_RTS;
 	ioctl(m_portHandle, enableRTS ? TIOCMBIS : TIOCMBIC, &pinToControl);
+	printf("FTDI_D2XX_AVAILABLE RTS set\n");
 #endif
 }
 
@@ -166,6 +181,7 @@ void SerialIO::setDTR(bool enableDTR) {
 #else
 	int pinToControl = TIOCM_DTR;
 	ioctl(m_portHandle, enableDTR ? TIOCMBIS : TIOCMBIC, &pinToControl);
+	printf("FTDI_D2XX_AVAILABLE DTR set\n");
 #endif
 }
 
@@ -198,10 +214,13 @@ bool SerialIO::getCTSStatus() {
 void SerialIO::enumSerialPorts(std::vector<SerialPortInformation>& serialPorts) {
 	serialPorts.clear();
 
+	printf("Enter serial ports scan: \n");
 #ifdef FTDI_D2XX_AVAILABLE
+	printf("Enter serial ports scan within FTDI_AVAILABLE: \n");
 	// Add in the FTDI ports detected
 	DWORD numDevs;
 	FTDI::FTDIInterface ftdi;
+	printf("FTDI interface: %s", ftdi);
 	FTDI::FT_STATUS status = ftdi.FT_CreateDeviceInfoList(&numDevs);
 	if ((status == FTDI::FT_STATUS::FT_OK) && (numDevs)) {
 		FTDI::FT_DEVICE_LIST_INFO_NODE* devList = (FTDI::FT_DEVICE_LIST_INFO_NODE*)malloc(sizeof(FTDI::FT_DEVICE_LIST_INFO_NODE) * numDevs);
@@ -215,6 +234,7 @@ void SerialIO::enumSerialPorts(std::vector<SerialPortInformation>& serialPorts) 
 					info.pid = devList[index].ID & 0xFFFF;
 					info.vid = devList[index].ID >> 16;
 					quicka2w(devList[index].Description, info.productName);
+					printf("Device detected: %s\n", devList[index].Description);
 
 					// Ensure no duplicate port numbers names
 					int portIndex = 0;
@@ -339,11 +359,15 @@ void SerialIO::enumSerialPorts(std::vector<SerialPortInformation>& serialPorts) 
 	}
 
 #else
+	printf("Enter device scan:\n");
 #ifdef __APPLE__
 	DIR* dir = opendir("/dev");
-#else
-	DIR* dir = opendir("/sys/class/tty")
-#endif	
+#elif defined __linux
+	DIR* dir = opendir("/sys/class/tty");
+#elif defined __sun
+	DIR* dir = opendir("/dev/term");
+	printf("Sun devices:\n");
+#endif
 	if (!dir) return;
 	dirent* entry;
 	struct stat statbuf{};
@@ -353,6 +377,13 @@ void SerialIO::enumSerialPorts(std::vector<SerialPortInformation>& serialPorts) 
 		std::string tmp = entry->d_name;
 		if (tmp.substr(0,7) != "tty.usb") continue;
 		std::string name = "/dev/" + std::string(entry->d_name);
+		SerialPortInformation prt;
+		quicka2w(name, prt.portName);
+		serialPorts.push_back(prt);
+#elif defined __sun
+		std::string tmp = entry->d_name;
+		if (tmp.substr(0,7) != "0") continue;
+		std::string name = "/dev/term/" + std::string(entry->d_name);
 		SerialPortInformation prt;
 		quicka2w(name, prt.portName);
 		serialPorts.push_back(prt);
@@ -453,7 +484,7 @@ SerialIO::Response SerialIO::openPort(const std::wstring& portName) {
 	closePort();
 
 #ifdef FTDI_D2XX_AVAILABLE
-	if (portName.length() > std::string(FTDI_PORT_PREFIX).length()) {
+	if (portName.length() >= std::string(FTDI_PORT_PREFIX).length()) {
 		std::wstring prefix;
 		quicka2w(FTDI_PORT_PREFIX, prefix);
 		// Is it FTDI?
@@ -463,15 +494,16 @@ SerialIO::Response SerialIO::openPort(const std::wstring& portName) {
 
 			// See if it exists
 			auto f = std::find_if(serialPorts.begin(), serialPorts.end(), [&portName](const SerialPortInformation& serialport)-> bool {
+				printf("Device exists?\n");
 				return portName == serialport.portName;
 			});
 
 			// was it found?
 			if (f != serialPorts.end()) {
 				switch (m_ftdi.FT_Open(f->ftdiIndex)) {
-					case FTDI::FT_STATUS::FT_OK: break;
-					case FTDI::FT_STATUS::FT_DEVICE_NOT_OPENED: return Response::rInUse;
-					case FTDI::FT_STATUS::FT_DEVICE_NOT_FOUND: return Response::rNotFound;
+					case FTDI::FT_STATUS::FT_OK: printf("FT_OK\n"); break;
+					case FTDI::FT_STATUS::FT_DEVICE_NOT_OPENED: printf("FT_DEVICE_NOT_OPENED\n"); return Response::rInUse;
+					case FTDI::FT_STATUS::FT_DEVICE_NOT_FOUND: printf("FT_DEVICE_NOT_FOUND\n"); return Response::rNotFound;
 					default: return Response::rUnknownError;
 				}
 				updateTimeouts();
@@ -674,9 +706,16 @@ SerialIO::Response SerialIO::configurePort(const Configuration& configuration) {
 	if (ioctl(m_portHandle, TCSETS2, &term) < 0) return Response::rUnknownError;
 #else
 	term.c_cflag &= ~CBAUD;
+#ifdef __linux
 	term.c_cflag |= CBAUDEX;
 	if (cfsetspeed(&term, baud) < 0) return Response::rUnknownError;
+#else
+#ifdef __sun
+	term.c_cflag |= CBAUDEXT;
+	if (cfsetospeed(&term, baud) < 0) return Response::rUnknownError;
 #endif
+#endif
+#endif	
 	}
 #endif
 	// Apply that nonsense
